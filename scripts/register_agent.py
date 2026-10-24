@@ -20,6 +20,15 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
+# .env support (same pattern as lastmile.config): the README says the API key
+# and seed phrase may live in .env, so honour it here too.
+try:  # optional, only needed when credentials are kept in a .env file
+    from dotenv import load_dotenv
+
+    load_dotenv()  # no-op if .env does not exist
+except ImportError:  # pragma: no cover - dotenv is in requirements.txt
+    pass
+
 from uagents_core.utils.registration import (  # noqa: E402
     RegistrationRequestCredentials,
     register_chat_agent,
@@ -38,6 +47,19 @@ def main() -> int:  # pragma: no cover - requires real credentials
             "Get an API key at https://agentverse.ai/profile/api-keys - see .env.example"
         )
         return 2
+
+    # soft sanity checks for the two most common registration mistakes
+    if len(api_key) < 20:
+        print(
+            "WARNING: AGENTVERSE_KEY looks too short to be a real API key "
+            "(did a placeholder get left in?). A real Agentverse key is a long "
+            "string copied from agentverse.ai/profile/api-keys."
+        )
+    if len(seed) < 12:
+        print(
+            "WARNING: AGENT_SEED_PHRASE looks very short - use a long private "
+            "phrase (10+ words). It deterministically derives your agent address."
+        )
 
     # the mailbox submit endpoint the agent exposes locally
     endpoint = os.getenv("LOCAL_AGENT_ENDPOINT", f"http://127.0.0.1:{port}/submit")
