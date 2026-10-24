@@ -11,9 +11,15 @@ coordinator can resolve it for replies, and it delivers messages with
 ``uagents.communication.send_message_raw`` carrying the ChatMessage schema
 digest (the same wire shape ASI:One uses).
 
+Set SMOKE_TOPOLOGY=multi to also spawn the three specialist agents and run
+the coordinator in delegated mode; the run then asserts that no
+``[fallback]`` note ever appeared (i.e. every specialist call was answered
+remotely, not computed locally).
+
 Usage:
-    $env:PYTHONPATH="src"
-    python scripts\acp_smoke.py
+    set PYTHONPATH=src
+    python scripts/acp_smoke.py                          # single topology
+    python scripts/acp_smoke.py with SMOKE_TOPOLOGY=multi  # multi topology
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -33,6 +40,11 @@ SMOKE_PORT = int(os.getenv("SMOKE_PORT", "8020"))
 CLIENT_PORT = SMOKE_PORT + 5
 CLIENT_SEED = "acp-smoke-client-seed"
 ACK_TIMEOUT = 60.0  # seconds per step
+SPECIALISTS = [
+    ("safety_agent", "safety_agent", SMOKE_PORT + 1),
+    ("matcher_agent", "matcher_agent", SMOKE_PORT + 2),
+    ("planner_agent", "planner_agent", SMOKE_PORT + 3),
+]
 
 
 # ----------------------------------------------------------------------
@@ -97,6 +109,7 @@ async def main() -> int:
     CHAT_DIGEST = Model.build_schema_digest(ChatMessage)
     identity = Identity.from_seed(CLIENT_SEED, 0)
     resolver = GlobalResolver()
+    collected_texts: list[str] = []
 
     async def wait_resolvable(address: str, label: str, timeout: float = 60.0):
         """Poll Almanac REST until `address` resolves to at least one endpoint."""
@@ -110,23 +123,96 @@ async def main() -> int:
             await asyncio.sleep(2.0)
         raise TimeoutError(f"{label} never became resolvable within {timeout}s")
 
-    # 1) launch the real coordinator as a subprocess
+    async def wait_tcp(ports: list[int], timeout: float = 30.0):
+        """Wait until every specialist port accepts a TCP connection."""
+        loop = asyncio.get_event_loop()
+        pending = list(ports)
+        deadline = loop.time() + timeout
+        while pending and loop.time() < deadline:
+            for port in list(pending):
+                try:
+                    _, writer = await asyncio.open_connection("127.0.0.1", port)
+                    writer.close()
+                    pending.remove(port)
+                except OSError:
+                    pass
+            if pending:
+                await asyncio.sleep(0.5)
+        if pending:
+            raise TimeoutError(f"specialist ports never opened: {pending}")
+
+    def spawn_agent(module_path: str, env: dict):
+        proc = subprocess.Popen(
+            [sys.executable, os.path.join(REPO_ROOT, "src", "lastmile", module_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            text=True,
+        )
+        return proc
+
+    async def pump_logs(proc, tag: str) -> None:
+        """Best-effort drain of a subprocess log (also the evidence trail)."""
+
+        async def _pump():
+            assert proc.stdout is not None
+            while True:
+                line = await asyncio.to_thread(proc.stdout.readline)
+                if not line:
+                    break
+                trimmed = line.strip()
+                specialist_lines.setdefault(tag, []).append(trimmed)
+                print(f"[{tag}] {trimmed[:140]}")
+
+        asyncio.create_task(_pump())
+
+    # ------------------------------------------------------------------
+    # launch agents
+    # ------------------------------------------------------------------
+    topology = os.getenv("SMOKE_TOPOLOGY", "single").lower()
     env = dict(os.environ)
     env["PYTHONPATH"] = os.path.join(REPO_ROOT, "src")
     env["PORT"] = str(SMOKE_PORT)
-    proc = subprocess.Popen(
-        [sys.executable, os.path.join(REPO_ROOT, "src", "lastmile", "agents", "coordinator.py")],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        env=env,
-        text=True,
-    )
-    coordinator_address = None
+
+    # evidence trail: everything each subprocess printed, keyed by tag
+    specialist_lines: dict[str, list[str]] = {"coordinator": []}
+
+    procs: list[subprocess.Popen] = []
+
     try:
+        if topology == "multi":
+            env["AGENT_TOPOLOGY"] = "multi"
+            # isolated, per-run address book so delegated calls cannot be
+            # poisoned by entries from earlier runs
+            book_path = os.path.join(
+                tempfile.gettempdir(), "lastmile_acp_smoke_address_book.json"
+            )
+            if os.path.exists(book_path):
+                try:
+                    os.remove(book_path)
+                except OSError:
+                    pass
+            env["LASTMILE_ADDRESS_BOOK"] = book_path
+
+            for _name, module, port in SPECIALISTS:
+                spec_proc = spawn_agent(os.path.join("agents", f"{module}.py"), env)
+                procs.append(spec_proc)
+                asyncio.create_task(pump_logs(spec_proc, module))
+            await wait_tcp([port for _n, _m, port in SPECIALISTS])
+            print("[smoke] specialist agents listening on ports %s" % ", ".join(
+                str(port) for _n, _m, port in SPECIALISTS
+            ))
+
+        # the coordinator must start last in multi mode so the address book
+        # already contains every specialist address
+        coordinator = spawn_agent(os.path.join("agents", "coordinator.py"), env)
+        procs.append(coordinator)
+
         # read startup logs for the agent address
+        coordinator_address = None
         deadline = asyncio.get_event_loop().time() + 40
         while coordinator_address is None and asyncio.get_event_loop().time() < deadline:
-            line = await asyncio.to_thread(proc.stdout.readline)  # type: ignore[union-attr]
+            line = await asyncio.to_thread(coordinator.stdout.readline)  # type: ignore[union-attr]
             if not line:
                 break
             line_s = line.strip()
@@ -137,6 +223,7 @@ async def main() -> int:
             print("SMOKE FAILED: coordinator did not report its address")
             return 1
         print(f"\n[smoke] coordinator address: {coordinator_address}\n")
+        asyncio.create_task(pump_logs(coordinator, "coordinator"))
 
         client, queue = build_client()
         assert client.address == identity.address, (
@@ -174,6 +261,11 @@ async def main() -> int:
             while not queue.empty():
                 queue.get_nowait()
 
+        def record_text(msg) -> None:
+            collected_texts.append(
+                "\n".join(item.text for item in msg.content if isinstance(item, TextContent))
+            )
+
         async def next_card(timeout=ACK_TIMEOUT):
             deadline = asyncio.get_event_loop().time() + timeout
             while True:
@@ -181,6 +273,7 @@ async def main() -> int:
                 if remaining <= 0:
                     raise TimeoutError(f"no card received within {timeout}s")
                 msg = await asyncio.wait_for(queue.get(), timeout=remaining)
+                record_text(msg)
                 kind, payload = extract_card(msg)
                 if kind is not None:
                     return kind, payload
@@ -191,10 +284,12 @@ async def main() -> int:
             if remaining <= 0:
                 raise TimeoutError(f"no text received within {timeout}s")
             msg = await asyncio.wait_for(queue.get(), timeout=remaining)
-            return "\n".join(
-                item.text for item in msg.content
-                if isinstance(item, TextContent)
-            )
+            record_text(msg)
+            text = collected_texts[-1]
+            if not text.strip():
+                # card-only message; keep waiting for a text response
+                return await next_text(timeout=remaining)
+            return text
 
         # 1) greeting -> form card
         await drain_queue()
@@ -258,13 +353,36 @@ async def main() -> int:
         assert "current status" in status_text.lower(), status_text
         print("[smoke] status query OK")
 
+        # 7) in multi mode, prove the flow genuinely reached each specialist:
+        #    each agent logs one line per handled request, and no
+        #    local-fallback note ever appeared in user-facing text
+        if topology == "multi":
+            expect = {
+                "safety_agent": "checked don_",
+                "matcher_agent": "matched don_",
+                "planner_agent": ("built plan for don_", "proposed don_"),
+            }
+            for tag, markers in expect.items():
+                if isinstance(markers, str):
+                    markers = (markers,)
+                printed = specialist_lines.get(tag, [])
+                assert any(m in line for line in printed for m in markers), (
+                    f"no evidence that {tag} handled a request; printed={printed!r}"
+                )
+            fallbacks = [t for t in collected_texts if "[fallback]" in t]
+            assert not fallbacks, (
+                f"multi-mode run fell back to local computation: {fallbacks!r}"
+            )
+            print("[smoke] multi topology: all specialist calls delegated remotely OK")
+
         print("\nALL ACP SMOKE STEPS PASSED")
         return 0
     except Exception as exc:
         print(f"\nSMOKE FAILED: {exc!r}")
         return 1
     finally:
-        proc.terminate()  # best effort on all platforms
+        for proc in procs:
+            proc.terminate()  # best effort on all platforms
 
 
 if __name__ == "__main__":

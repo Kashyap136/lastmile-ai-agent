@@ -20,11 +20,14 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from uagents import Agent, Context, Model, Protocol
+from uagents.communication import send_message_raw
 from uagents_core.contrib.protocols.chat import (
     ChatAcknowledgement,
     ChatMessage,
     chat_protocol_spec,
 )
+from uagents_core.identity import Identity
+from uagents_core.types import DeliveryStatus
 
 # make `src` importable when running scripts directly from the repo root
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src"))
@@ -63,6 +66,10 @@ logger = logging.getLogger("lastmile.coordinator")
 settings = load_settings()
 configure_logging(settings.log_level)
 
+# the Agent class binds to the current event loop at construction time; the
+# identity is derived from the seed only (agent name does not affect it)
+_coordinator_seed = settings.seed_phrase or "lastmile-rescue-coordinator-demo-seed"
+
 agents_recipients = load_demo_recipients()
 matcher = RecipientMatcher(agents_recipients, donor_zone_centers=DEMO_ZONES)
 planner = PickupPlanner(agents_recipients, donor_zone_centers=DEMO_ZONES, routing_api_url=settings.routing_api_url)
@@ -73,9 +80,21 @@ notify_fn = lambda plan_dict: notify_recipient(plan_dict, settings.recipient_not
 
 pending_specialist_requests: dict[str, asyncio.Future] = {}
 
+# per-message serialization of storage writes (see handle_messages_concurrently)
+_chat_locks: dict[str, asyncio.Lock] = {}
+
+
+def chat_lock_for(user_key: str) -> asyncio.Lock:
+    return _chat_locks.setdefault(user_key, asyncio.Lock())
+
 
 async def remote_request(specialist: str, payload_json: str) -> dict | None:
-    """Transport used by RemoteSpecialistTools: send + await the response."""
+    """Transport used by RemoteSpecialistTools: send + await the response.
+
+    Any transport failure (unknown address, undeliverable request, crash or
+    timeout) resolves to None so the tools layer can apply its timeout and
+    retry policy deterministically - exceptions never escape this shim.
+    """
     address = {
         "safety": settings.safety_agent_address or read_address("safety_agent"),
         "matcher": settings.matcher_agent_address or read_address("matcher_agent"),
@@ -93,8 +112,24 @@ async def remote_request(specialist: str, payload_json: str) -> dict | None:
     future: asyncio.Future = loop.create_future()
     pending_specialist_requests[request_id] = future
     try:
-        await coordinator_agent.send(address, envelope)
+        status = await send_message_raw(
+            address,
+            SPECIALIST_REQUEST_DIGEST,
+            envelope.model_dump_json(),
+            sender=coordinator_identity,
+        )
+        if getattr(status, "status", None) is not DeliveryStatus.DELIVERED:
+            logger.warning(
+                "specialist request %s to %s not delivered: %s",
+                request_id,
+                specialist,
+                getattr(status, "detail", status),
+            )
+            return None
         return await future
+    except Exception as exc:
+        logger.warning("specialist transport failed for %s: %r", specialist, exc)
+        return None
     finally:
         pending_specialist_requests.pop(request_id, None)
 
@@ -115,7 +150,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..",
 
 coordinator_agent = Agent(
     name=settings.agent_name,
-    seed=settings.seed_phrase or "lastmile-rescue-coordinator-demo-seed",
+    seed=_coordinator_seed,
     port=settings.port,
     # explicit local endpoint: enables direct agent-to-agent delivery for the
     # specialist agents on the same machine; the mailbox client still runs
@@ -124,8 +159,18 @@ coordinator_agent = Agent(
     mailbox=True,
     publish_agent_details=True,
     readme_path=os.path.join(_REPO_ROOT, "README.md"),
-    handle_messages_concurrently=False,  # keep storage writes strictly ordered
+    # chat turns may await remote specialist responses; when the specialist
+    # reply arrives (a separate message), it must be dispatched while the
+    # chat turn is still waiting - storage writes stay strictly ordered per
+    # user through chat_lock_for().
+    handle_messages_concurrently=True,
 )
+
+# address consistency is a wire-level requirement: specialist agents reply
+# to `coordinator_identity.address`, which must equal coordinator_agent.address
+coordinator_identity = Identity.from_seed(_coordinator_seed, 0)
+assert coordinator_identity.address == coordinator_agent.address
+SPECIALIST_REQUEST_DIGEST = Model.build_schema_digest(SpecialistRequest)
 
 chat_proto = Protocol(spec=chat_protocol_spec)
 
@@ -181,9 +226,13 @@ async def on_chat_message(ctx: Context, sender: str, msg: ChatMessage) -> None:
     if not text.strip():
         return
 
-    state = _load_session(ctx, sender)
-    result = await engine.handle_text(state, text)
-    _save_session(ctx, result.state)
+    # messages process concurrently (required so specialist responses can be
+    # dispatched while a chat turn awaits) - storage reads/writes stay
+    # strictly ordered per user through this lock
+    async with chat_lock_for(sender):
+        state = _load_session(ctx, sender)
+        result = await engine.handle_text(state, text)
+        _save_session(ctx, result.state)
 
     for output in result.outputs:
         if output.has_card():

@@ -134,3 +134,92 @@ async def test_planner_infeasible_response_carries_reason():
     proposal, error = await tools.propose_windows(_intake(), "rcp_01")
     assert proposal is None
     assert "no service window" in error
+
+
+# wire contract ----------------------------------------------------------------
+
+
+async def test_outbound_payload_matches_specialist_schema():
+    """The JSON shape RemoteSpecialistTools sends must parse as the
+    SpecialistRequestPayload schema the specialist agents expect."""
+    from lastmile.protocols import SpecialistRequestPayload
+    from lastmile.models.donation import intake_from_json
+
+    captured: dict[str, str | None] = {}
+
+    async def capture(specialist: str, payload_json: str):
+        captured["specialist"] = specialist
+        captured["payload_json"] = payload_json
+        return None  # send the flow to the explicit-failure branch fast
+
+    tools = RemoteSpecialistTools(capture, timeout_seconds=0.01, retries=0, fallback=None)
+    intake = _intake()
+
+    # safety + matcher raise SpecialistError when all attempts fail
+    for expect, method_call in (
+        ("safety", tools.check_safety),
+        ("matcher", tools.find_recipients),
+    ):
+        captured.clear()
+        with pytest.raises(SpecialistError):
+            await method_call(intake)
+        assert captured["specialist"] == expect
+        payload = SpecialistRequestPayload.parse_raw(captured["payload_json"])
+        assert payload.donation_json
+        # the donation JSON must survive a full round-trip into the
+        # same parser the specialist agents use
+        rebuilt, errors = intake_from_json(payload.donation_json)
+        assert rebuilt is not None and not errors
+        assert rebuilt.description == intake.description
+        assert rebuilt.category == intake.category
+
+
+def _plan_stub():
+    from lastmile.models.pickup import PickupPlan, PickupWindow, TravelEstimate
+
+    return PickupPlan(
+        plan_id="plan_stub",
+        donation_id="don_test",
+        recipient_id="rcp_02",
+        recipient_name="Stub Recipient (demo)",
+        window=PickupWindow(window_id="w3", start=datetime_now(), end=datetime_now() + timedelta(minutes=40)),
+        travel=TravelEstimate(distance_km=1.0, duration_minutes=4.0, data_source=DataSource.CALCULATED_ESTIMATE),
+        route_summary="calculated_estimate: 1 km, ~4 min",
+        route_source="calculated_estimate",
+    )
+
+
+async def test_planner_payload_carries_window_and_proposal():
+    from lastmile.protocols import SpecialistRequestPayload
+    from lastmile.models.pickup import PickupProposal
+
+    captured: dict[str, str | None] = {}
+
+    async def capture(specialist: str, payload_json: str):
+        captured["payload_json"] = payload_json
+        return None
+
+    tools = RemoteSpecialistTools(capture, timeout_seconds=0.01, retries=0, fallback=None)
+    plan, error = await tools.build_plan(_intake(), _plan_stub(), "w3")
+    assert plan is None and "did not respond" in error
+    payload = SpecialistRequestPayload.parse_raw(captured["payload_json"])
+    assert payload.window_id == "w3"
+    assert payload.recipient_id == "rcp_02"
+    proposal_payload = PickupProposal.parse_raw(payload.proposal_json)
+    assert proposal_payload.recipient_id == "rcp_02"
+
+
+async def test_matcher_payload_carries_recipient_hint():
+    from lastmile.protocols import SpecialistRequestPayload
+
+    captured: dict[str, str | None] = {}
+
+    async def capture(specialist: str, payload_json: str):
+        captured["payload_json"] = payload_json
+        return None
+
+    tools = RemoteSpecialistTools(capture, timeout_seconds=0.01, retries=0, fallback=None)
+    proposal, error = await tools.propose_windows(_intake(), "rcp_07")
+    assert proposal is None and "did not respond" in error
+    payload = SpecialistRequestPayload.parse_raw(captured["payload_json"])
+    assert payload.recipient_id == "rcp_07"

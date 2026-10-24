@@ -22,6 +22,7 @@ from ..models.donation import DonationIntake
 from ..models.matching import MatchResult
 from ..models.pickup import PickupPlan, PickupProposal
 from ..models.safety import SafetyDecision
+from ..protocols import SpecialistRequestPayload
 
 logger = logging.getLogger("lastmile.tools")
 
@@ -84,6 +85,26 @@ class LocalSpecialistTools:
 Transport = Callable[[str, str], Awaitable[dict | None]]
 
 
+def _payload_json(
+    donor_json: str,
+    recipient_id: str = "",
+    proposal_json: str = "",
+    window_id: str = "",
+) -> str:
+    """Build the canonical SpecialistRequestPayload wire JSON.
+
+    The specialist agents parse exactly this schema, so every remote call
+    must round-trip through it - never send ad-hoc shapes.
+    """
+    payload = SpecialistRequestPayload(
+        donation_json=donor_json,
+        recipient_id=recipient_id,
+        proposal_json=proposal_json,
+        window_id=window_id,
+    )
+    return payload.model_dump_json()
+
+
 class RemoteSpecialistTools:
     """Delegates specialist work to Layer-3 agents.
 
@@ -105,7 +126,7 @@ class RemoteSpecialistTools:
         self._fallback = fallback
 
     async def check_safety(self, intake: DonationIntake) -> SafetyDecision:
-        payload = {"donation_id": intake.donation_id, "payload": intake.model_dump(mode="json")}
+        payload = _payload_json(intake.model_dump_json())
         response = await self._request_with_retries("safety", "safety agent", payload)
         if response is not None:
             if response.get("ok"):
@@ -121,7 +142,7 @@ class RemoteSpecialistTools:
         raise SpecialistError(_attempt_message("safety validator"))
 
     async def find_recipients(self, intake: DonationIntake) -> MatchResult:
-        payload = {"donation_id": intake.donation_id, "payload": intake.model_dump(mode="json")}
+        payload = _payload_json(intake.model_dump_json())
         response = await self._request_with_retries("matcher", "matcher agent", payload)
         if response is not None:
             if response.get("ok"):
@@ -139,11 +160,7 @@ class RemoteSpecialistTools:
     async def propose_windows(
         self, intake: DonationIntake, recipient_id: str
     ) -> tuple[PickupProposal | None, str]:
-        payload = {
-            "donation_id": intake.donation_id,
-            "payload": intake.model_dump(mode="json"),
-            "recipient_id": recipient_id,
-        }
+        payload = _payload_json(intake.model_dump_json(), recipient_id=recipient_id)
         response = await self._request_with_retries("planner", "planner agent", payload)
         if response is not None:
             if response.get("ok"):
@@ -155,17 +172,17 @@ class RemoteSpecialistTools:
             raise SpecialistError(f"planner agent error: {response.get('error', 'unknown')}")
         if self._fallback is not None:
             return await self._fallback.propose_windows(intake, recipient_id)
-        return None, self._attempt_message("pickup planner")
+        return None, _attempt_message("pickup planner")
 
     async def build_plan(
         self, intake: DonationIntake, proposal: PickupProposal, window_id: str
     ) -> tuple[PickupPlan | None, str]:
-        payload = {
-            "donation_id": intake.donation_id,
-            "payload": intake.model_dump(mode="json"),
-            "proposal": proposal.model_dump(mode="json"),
-            "window_id": window_id,
-        }
+        payload = _payload_json(
+            intake.model_dump_json(),
+            recipient_id=proposal.recipient_id,
+            proposal_json=proposal.model_dump_json(),
+            window_id=window_id,
+        )
         response = await self._request_with_retries("planner", "planner agent", payload, "plan")
         if response is not None:
             if response.get("ok"):
@@ -177,14 +194,17 @@ class RemoteSpecialistTools:
             raise SpecialistError(f"planner agent error: {response.get('error', 'unknown')}")
         if self._fallback is not None:
             return await self._fallback.build_plan(intake, proposal, window_id)
-        return None, self._attempt_message("plan builder")
+        return None, _attempt_message("plan builder")
 
     # ---- internals ----------------------------------------------------------
 
     async def _request_with_retries(
-        self, specialist: str, label: str, payload: dict, variant: str = ""
+        self, specialist: str, label: str, payload_json: str, variant: str = ""
     ) -> dict | None:
         """Run one remote call with bounded retries on transport failures.
+
+        ``payload_json`` is the canonical SpecialistRequestPayload JSON
+        produced by ``_payload_json`` (never re-encoded here).
 
         Returns the response dict, or None when all attempts timed out.
         Explicit agent errors raise SpecialistError immediately - retrying
@@ -192,7 +212,7 @@ class RemoteSpecialistTools:
         """
         attempt = 0
         while attempt <= self._retries:
-            response = await self._request_fn(specialist, json.dumps(payload))
+            response = await self._request_fn(specialist, payload_json)
             if response is None:
                 logger.warning(
                     "%s%s timed out, attempt %d/%d",

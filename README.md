@@ -102,6 +102,13 @@ python src\lastmile\agents\planner_agent.py
 
 In `multi` mode the coordinator enforces **timeouts (20 s) + bounded retries (2)** per call. If a specialist stays unreachable the coordinator reports the explicit failure state, and only then - with a visible `[fallback]` label - computes locally so the demo remains usable.
 
+The `multi` topology has its own end-to-end smoke run (it also asserts that no `[fallback]` note appeared, i.e. every specialist call was answered remotely by the live agents):
+
+```powershell
+$env:SMOKE_TOPOLOGY="multi"
+.\venv\Scripts\python scripts\acp_smoke.py
+```
+
 ## Tests
 
 ```powershell
