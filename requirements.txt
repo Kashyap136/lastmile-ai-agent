@@ -1,0 +1,6 @@
+uagents>=0.25.5
+uagents-core>=0.4.9
+requests>=2.31
+python-dotenv>=1.0
+pytest>=8.0
+pytest-asyncio>=0.25
