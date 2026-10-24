@@ -117,7 +117,11 @@ coordinator_agent = Agent(
     name=settings.agent_name,
     seed=settings.seed_phrase or "lastmile-rescue-coordinator-demo-seed",
     port=settings.port,
-    mailbox=True,                      # documented mailbox pattern: no explicit endpoint
+    # explicit local endpoint: enables direct agent-to-agent delivery for the
+    # specialist agents on the same machine; the mailbox client still runs
+    # (mailbox=True) so ASI:One delivers through the Agentverse mailbox.
+    endpoint=[f"http://127.0.0.1:{settings.port}/submit"],
+    mailbox=True,
     publish_agent_details=True,
     readme_path=os.path.join(_REPO_ROOT, "README.md"),
     handle_messages_concurrently=False,  # keep storage writes strictly ordered

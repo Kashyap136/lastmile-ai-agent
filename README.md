@@ -30,6 +30,7 @@ src/lastmile/
   agents/              # coordinator uAgent + 3 specialist agents
 scripts/
   register_agent.py    # Agentverse programmatic registration
+  acp_smoke.py         # end-to-end wire-protocol smoke test (no account needed)
 tests/                 # pytest suite (no network or credentials required)
 ```
 
@@ -109,6 +110,49 @@ $env:PYTHONPATH="src"
 ```
 
 Covers: complete donation-to-confirmation flow, invalid donations, no matching recipients, card selection parsing (JSON and planner prose), safety-rule outcomes, planner infeasibility, routing-API fallback labelling, notification honesty (never claims success without 2xx), remote-tool timeout/retry behaviour, and session expiry.
+
+## End-to-end smoke test (no Agentverse account needed)
+
+`scripts\acp_smoke.py` runs the **real coordinator as a subprocess** plus a real
+chat-protocol client agent. The client speaks the actual wire protocol
+(`send_message_raw` + the Agent Chat Protocol ChatMessage schema digest), so
+this verifies the same delivery path ASI:One uses:
+
+```powershell
+$env:PYTHONPATH="src"
+.\venv\Scripts\python scripts\acp_smoke.py
+```
+
+Walks the complete flow over protocol envelopes and prints
+`ALL ACP SMOKE STEPS PASSED` on success:
+
+1. `hi` -> `form` card
+2. JSON donation submission -> `carousel` with labelled demo matches
+3. recipient selection -> `detail` card with feasible windows
+4. window selection -> `review` card
+5. approval -> honest receipt (no demo notification webhook configured, so the
+   donation stays `awaiting_recipient_confirmation` - never `dispatched`)
+6. `status` -> full status trail
+
+### Troubleshooting
+
+- **"I do not have enough funds to register on Almanac contract" / "send funds
+  to wallet address: fetch1..."** - harmless for this project. Without wallet
+  funds the agent still registers its endpoints through the **Almanac REST API**
+  (`Registration on Almanac API successful`), and ASI:One + agent-to-agent
+  messaging work through that registration. Only the optional on-chain contract
+  registration is skipped.
+- **"Endpoint configuration overrides mailbox setting"** - expected. The
+  coordinator binds an explicit local endpoint so the specialist agents are
+  reachable agent-to-agent on the same machine; the mailbox client still runs,
+  which is what ASI:One uses.
+- **Agent does not resolve / replies never arrive** - both agents must be
+  registered on the Almanac REST API at the same time (the smoke test waits for
+  both). If you are behind a proxy or offline, agent-to-agent delivery fails
+  even though tests pass; retry once online.
+  - **Chrome/opening the agent inspector fails on localhost** - modern browsers
+    gate local-network access; allow the permission prompt or ignore it, it does
+    not affect message delivery.
 
 ## Honesty rules baked into the product
 

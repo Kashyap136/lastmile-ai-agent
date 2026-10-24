@@ -38,6 +38,7 @@ planner_agent = Agent(
     name="lastmile_planner_agent",
     seed=os.getenv("PLANNER_AGENT_SEED", "lastmile-planner-agent-demo-seed"),
     port=settings.port + 3,
+    endpoint=[f"http://127.0.0.1:{settings.port + 3}/submit"],
     mailbox=True,
     publish_agent_details=False,
 )

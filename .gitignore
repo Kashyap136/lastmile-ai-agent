@@ -6,6 +6,7 @@ __pycache__/
 .env
 *.log
 agent_storage/
+agent*_data.json
 .idea/
 .vscode/
 dist/

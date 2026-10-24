@@ -30,6 +30,7 @@ safety_agent = Agent(
     name="lastmile_safety_agent",
     seed=os.getenv("SAFETY_AGENT_SEED", "lastmile-safety-agent-demo-seed"),
     port=settings.port + 1,
+    endpoint=[f"http://127.0.0.1:{settings.port + 1}/submit"],
     mailbox=True,
     publish_agent_details=False,
 )
