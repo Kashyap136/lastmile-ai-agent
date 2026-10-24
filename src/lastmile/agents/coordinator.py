@@ -29,10 +29,16 @@ from uagents_core.contrib.protocols.chat import (
 from uagents_core.identity import Identity
 from uagents_core.types import DeliveryStatus
 
-# make `src` importable when running scripts directly from the repo root
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src"))
+# make `lastmile` importable when running this file directly as a script:
+# the file lives at <repo>/src/lastmile/agents/coordinator.py, so the package
+# parent directory (`<repo>/src`) is exactly two levels up.
+sys.path.insert(
+    0,
+    os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")),
+)
 
 from lastmile.adapters.notify import notify_recipient  # noqa: E402
+from uagents_core.config import AgentverseConfig  # noqa: E402
 from lastmile.chat.messages import (  # noqa: E402
     ack_message,
     card_message,
@@ -148,17 +154,52 @@ engine = WorkflowEngine(tools, notify_fn=notify_fn)
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
+# ASI:One delivery goes through the Agentverse mailbox. Local smoke/test runs
+# opt out with LASTMILE_USE_MAILBOX=0 so they neither run the mailbox client
+# nor touch the production agent's mailbox registration.
+_mailbox_enabled = os.getenv("LASTMILE_USE_MAILBOX", "1").strip().lower() not in ("0", "false", "no")
+_endpoints: list[str] = [f"http://127.0.0.1:{settings.port}/submit"]
+if _mailbox_enabled:
+    _endpoints.append(AgentverseConfig().mailbox_endpoint)
+
 coordinator_agent = Agent(
     name=settings.agent_name,
     seed=_coordinator_seed,
     port=settings.port,
-    # explicit local endpoint: enables direct agent-to-agent delivery for the
-    # specialist agents on the same machine; the mailbox client still runs
-    # (mailbox=True) so ASI:One delivers through the Agentverse mailbox.
-    endpoint=[f"http://127.0.0.1:{settings.port}/submit"],
-    mailbox=True,
+    # two delivery paths, both registered in the almanac record:
+    # - local:  same-machine agent-to-agent delivery (specialist agents, smoke client)
+    # - mailbox: Agentverse-hosted delivery so ASI:One chat messages reach this agent
+    # Including the mailbox URL in the endpoint list is what actually starts
+    # MailboxClient (uagents checks the endpoint list, not the mailbox flag);
+    # with an explicit local endpoint alone the mailbox client never runs and
+    # Agentverse cannot route chat messages ("unable to route envelope").
+    # Smoke runs override LASTMILE_USE_MAILBOX=0 and drop the mailbox path.
+    endpoint=_endpoints,
     publish_agent_details=True,
     readme_path=os.path.join(_REPO_ROOT, "README.md"),
+    # published with every boot so the public Agentverse/almanac profile stays
+    # complete regardless of registration order (register_agent.py sets the
+    # same values; the runtime registration previously reset them to null).
+    description=(
+        "Autonomous surplus-food rescue coordinator: validates donations, "
+        "matches recipient organisations and coordinates feasible pickups "
+        "through interactive chat cards."
+    ),
+    metadata={
+        "display_name": "LastMile Rescue",
+        "short_description": "Coordinates surplus-food rescue pickups end-to-end.",
+        "long_description": (
+            "LastMile Rescue validates surplus-food donations against "
+            "structured safety rules, matches them with recipient "
+            "organisations (clearly-labelled demo dataset), proposes "
+            "feasible pickup windows with labelled travel estimates and "
+            "tracks each donation's status trail."
+        ),
+        "recommended_use_case": (
+            "Donate surplus food safely: describe the food, approve a "
+            "recipient and a pickup window, and track the rescue."
+        ),
+    },
     # chat turns may await remote specialist responses; when the specialist
     # reply arrives (a separate message), it must be dispatched while the
     # chat turn is still waiting - storage writes stay strictly ordered per

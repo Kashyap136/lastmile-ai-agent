@@ -14,7 +14,10 @@ import sys
 
 from uagents import Agent, Context
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src"))
+sys.path.insert(
+    0,
+    os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")),
+)
 
 from lastmile.config import configure_logging, load_settings  # noqa: E402
 from lastmile.data.zones import DEMO_ZONES  # noqa: E402

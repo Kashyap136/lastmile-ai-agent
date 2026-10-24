@@ -39,6 +39,13 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 SMOKE_PORT = int(os.getenv("SMOKE_PORT", "8020"))
 CLIENT_PORT = SMOKE_PORT + 5
 CLIENT_SEED = "acp-smoke-client-seed"
+# CRITICAL isolation: the coordinator below must never inherit the production
+# AGENT_SEED_PHRASE (a shared seed would make the smoke process reuse the real
+# agent's identity, storage and Agentverse registration - it once overwrote
+# the public record's endpoint with the smoke port). A dedicated smoke seed
+# keeps the smoke coordinator a fully separate temporary agent.
+COORDINATOR_SEED = "lastmile-acp-smoke-coordinator-seed"
+
 ACK_TIMEOUT = 60.0  # seconds per step
 SPECIALISTS = [
     ("safety_agent", "safety_agent", SMOKE_PORT + 1),
@@ -173,6 +180,10 @@ async def main() -> int:
     env = dict(os.environ)
     env["PYTHONPATH"] = os.path.join(REPO_ROOT, "src")
     env["PORT"] = str(SMOKE_PORT)
+    # full smoke isolation (see COORDINATOR_SEED above): distinct identity =>
+    # distinct storage; and no mailbox client during smoke runs
+    env["AGENT_SEED_PHRASE"] = COORDINATOR_SEED
+    env["LASTMILE_USE_MAILBOX"] = "0"
 
     # evidence trail: everything each subprocess printed, keyed by tag
     specialist_lines: dict[str, list[str]] = {"coordinator": []}
